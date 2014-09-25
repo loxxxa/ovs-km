@@ -2125,16 +2125,6 @@ static const struct nla_policy band_policy[OVS_BAND_ATTR_MAX + 1] = {
 	[OVS_BAND_ATTR_STATS] = { .len = sizeof(struct ovs_flow_stats) },
 };
 
-static struct genl_family dp_meter_genl_family = {
-	.id = GENL_ID_GENERATE,
-	.hdrsize = sizeof(struct ovs_header),
-	.name = OVS_METER_FAMILY,
-	.version = OVS_METER_VERSION,
-	.maxattr = OVS_METER_ATTR_MAX,
-	.netnsok = true,
-	.parallel_ops = true,
-};
-
 struct sk_buff *ovs_meter_cmd_reply_start(struct genl_info *info, u8 cmd,
 					  struct ovs_header **ovs_reply_header)
 {
@@ -2573,6 +2563,18 @@ static struct genl_ops dp_meter_genl_ops[] = {
 	  .policy = meter_policy,
 	  .doit = ovs_meter_cmd_del
 	},
+};
+
+static struct genl_family dp_meter_genl_family = {
+	.id = GENL_ID_GENERATE,
+	.hdrsize = sizeof(struct ovs_header),
+	.name = OVS_METER_FAMILY,
+	.version = OVS_METER_VERSION,
+	.maxattr = OVS_METER_ATTR_MAX,
+	.netnsok = true,
+	.parallel_ops = true,
+	.ops = dp_meter_genl_ops,
+	.n_ops = ARRAY_SIZE(dp_meter_genl_ops),
 };
 
 struct genl_family dp_vport_genl_family = {
