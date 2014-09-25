@@ -2133,8 +2133,6 @@ static struct genl_family dp_meter_genl_family = {
 	.maxattr = OVS_METER_ATTR_MAX,
 	.netnsok = true,
 	.parallel_ops = true,
-	.ops = dp_meter_genl_ops,
-	.n_ops = ARRAY_SIZE(dp_meter_genl_ops),
 };
 
 struct sk_buff *ovs_meter_cmd_reply_start(struct genl_info *info, u8 cmd,
