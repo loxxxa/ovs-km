@@ -2132,7 +2132,9 @@ static struct genl_family dp_meter_genl_family = {
 	.version = OVS_METER_VERSION,
 	.maxattr = OVS_METER_ATTR_MAX,
 	.netnsok = true,
-	SET_PARALLEL_OPS
+	.parallel_ops = true,
+	.ops = dp_meter_genl_ops,
+	.n_ops = ARRAY_SIZE(dp_meter_genl_ops),
 };
 
 struct sk_buff *ovs_meter_cmd_reply_start(struct genl_info *info, u8 cmd,
@@ -2587,18 +2589,6 @@ struct genl_family dp_vport_genl_family = {
 	.n_ops = ARRAY_SIZE(dp_vport_genl_ops),
 	.mcgrps = &ovs_dp_vport_multicast_group,
 	.n_mcgrps = 1,
-};
-
-static struct genl_family dp_meter_genl_family = {
-	.id = GENL_ID_GENERATE,
-	.hdrsize = sizeof(struct ovs_header),
-	.name = OVS_METER_FAMILY,
-	.version = OVS_METER_VERSION,
-	.maxattr = OVS_METER_ATTR_MAX,
-	.netnsok = true,
-	.parallel_ops = true,
-	.ops = dp_meter_genl_ops,
-	.n_ops = ARRAY_SIZE(dp_meter_genl_ops),
 };
 
 static struct genl_family *dp_genl_families[] = {
