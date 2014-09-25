@@ -74,7 +74,9 @@ DEFINE_STATIC_PER_THREAD_DATA(uint32_t, recirc_depth, 0)
 
 /* Configuration parameters. */
 enum { MAX_FLOWS = 65536 };     /* Maximum number of flows in flow table. */
-
+enum { MAX_METERS = 65536 };    /* Maximum number of meters. */
+enum { MAX_BANDS = 8 };         /* Maximum number of bands / meter. */
+ 
 /* Queues. */
 enum { MAX_QUEUE_LEN = 128 };   /* Maximum number of packets per queue. */
 enum { QUEUE_MASK = MAX_QUEUE_LEN - 1 };
@@ -106,6 +108,31 @@ struct dp_netdev_queue {
     struct dp_netdev_upcall upcalls[MAX_QUEUE_LEN] OVS_GUARDED;
     unsigned int head OVS_GUARDED;
     unsigned int tail OVS_GUARDED;
+};
+
+/* Set of supported meter flags */
+#define DP_SUPPORTED_METER_FLAGS_MASK \
+    (OFPMF13_STATS | OFPMF13_PKTPS | OFPMF13_KBPS | OFPMF13_BURST)
+
+/* Set of supported meter band types */
+#define DP_SUPPORTED_METER_BAND_TYPES           \
+    ( 1 << OFPMBT13_DROP )
+
+struct dp_meter_band {
+    struct ofputil_meter_band up; /* type, prec_level, pad, rate, burst_size */
+    uint32_t bucket; /* In 1/1000 packets (for PKTPS), or in bits (for KBPS) */
+    uint64_t packet_count;
+    uint64_t byte_count;
+};
+
+struct dp_meter {
+    uint16_t flags;
+    uint16_t n_bands;
+    uint32_t max_delta_t;
+    uint64_t used;
+    uint64_t packet_count;
+    uint64_t byte_count;
+    struct dp_meter_band bands[];
 };
 
 /* Datapath based on the network device interface from netdev.h.
@@ -164,6 +191,11 @@ struct dp_netdev {
     struct ovs_rwlock port_rwlock;
     struct hmap ports OVS_GUARDED;
     struct seq *port_seq;       /* Incremented whenever a port changes. */
+
+    /* Meters. */
+    struct ovs_mutex meter_locks[MAX_METERS];
+    struct dp_meter *meters[MAX_METERS]; /* Meter bands. */
+    uint32_t meter_free;                 /* Next free meter. */
 
     /* Forwarding threads. */
     struct latch exit_latch;
@@ -455,9 +487,14 @@ create_dp_netdev(const char *name, const struct dpif_class *class,
 {
     struct dp_netdev *dp;
     int error;
+    size_t i;
 
     dp = xzalloc(sizeof *dp);
     shash_add(&dp_netdevs, name, dp);
+
+    for (i=0; i < MAX_METERS; ++i) {
+        ovs_mutex_init(&dp->meter_locks[i]);
+    }
 
     *CONST_CAST(const struct dpif_class **, &dp->class) = class;
     *CONST_CAST(const char **, &dp->name) = xstrdup(name);
@@ -532,6 +569,16 @@ dp_netdev_purge_queues(struct dp_netdev *dp)
     }
 }
 
+static inline void
+dp_delete_meter(struct dp_netdev *dp, uint32_t meter_id)
+    OVS_REQUIRES(dp->meter_locks[meter_id])
+{
+    if (dp->meters[meter_id]) {
+        free(dp->meters[meter_id]);
+        dp->meters[meter_id] = NULL;
+    }
+}
+
 /* Requires dp_netdev_mutex so that we can't get a new reference to 'dp'
  * through the 'dp_netdevs' shash while freeing 'dp'. */
 static void
@@ -565,6 +612,13 @@ dp_netdev_free(struct dp_netdev *dp)
     fat_rwlock_unlock(&dp->queue_rwlock);
 
     fat_rwlock_destroy(&dp->queue_rwlock);
+
+    for (i=0; i < MAX_METERS; ++i) {
+        ovs_mutex_lock(&dp->meter_locks[i]);
+        dp_delete_meter(dp, i);
+        ovs_mutex_unlock(&dp->meter_locks[i]);
+        ovs_mutex_destroy(&dp->meter_locks[i]);
+    }
 
     classifier_destroy(&dp->cls);
     hmap_destroy(&dp->flow_table);
@@ -1734,35 +1788,237 @@ static void
 dpif_netdev_meter_get_features(const struct dpif * dpif OVS_UNUSED,
                                struct ofputil_meter_features *features)
 {
-    features->max_meters = 0;
-    features->band_types = 0;
-    features->capabilities = 0;
-    features->max_bands = 0;
-    features->max_color = 0;
+    features->max_meters = MAX_METERS;
+    features->band_types = DP_SUPPORTED_METER_BAND_TYPES;
+    features->capabilities = DP_SUPPORTED_METER_FLAGS_MASK;
+    features->max_bands = MAX_BANDS;
+	features->max_color = 0;
+}
+
+/* Returns false when packet needs to be dropped. */
+static bool
+dp_netdev_run_meter(struct dp_netdev *dp, struct ofpbuf *packet,
+                    uint32_t meter_id, long long int now)
+{
+    struct dp_meter *meter;
+    struct dp_meter_band *band;
+    long long int long_delta_t; /* msec */
+    uint32_t delta_t; /* msec */
+    uint32_t volume;
+    int i, band_exceeded_max = -1;
+    uint32_t band_exceeded_rate = 0;
+
+    if (meter_id >= MAX_METERS) {
+        return true;
+    }
+
+    ovs_mutex_lock(&dp->meter_locks[meter_id]);
+    meter = dp->meters[meter_id];
+    if (!meter) {
+        goto out;
+    }
+
+    long_delta_t = (now - meter->used); /* msec */
+
+    /* Make sure delta_t will not be too large, so that bucket will not
+     * wrap around below. */
+    delta_t = (long_delta_t > (long long int)meter->max_delta_t)
+        ? meter->max_delta_t : (uint32_t)long_delta_t;
+
+    meter->used = now;
+    meter->packet_count += 1;
+    meter->byte_count += packet->size_;
+
+    if (meter->flags & OFPMF13_PKTPS) {
+        /* Rate in packets/second, bucket 1/1000 packets. */
+        /* msec * packets/sec = 1/1000 packets. */
+        volume = 1000; /* Take one packet from the bucket. */
+    } else {
+        /* Rate in kbps, bucket in bits. */
+        /* msec * kbps = bits */
+        volume = packet->size_ * 8; /* How much to take from the bucket */
+    }
+
+    /* Update all bands and find the one hit with the highest rate */
+    for (i = 0; i < meter->n_bands; ++i) {
+        band = &meter->bands[i];
+
+        band->bucket += delta_t * band->up.rate;
+        if (band->bucket > band->up.burst_size) {
+            band->bucket = band->up.burst_size;
+        }
+        if (band->bucket >= volume) {
+            band->bucket -= volume;
+        } else if (band->up.rate > band_exceeded_rate) {
+            band_exceeded_rate = band->up.rate;
+            band_exceeded_max = i;
+        }
+    }
+
+    if (band_exceeded_max < 0) {
+        goto out; /* No band exceeded, do nothing. */
+    }
+
+    band = &meter->bands[band_exceeded_max];
+    band->packet_count += 1;
+    band->byte_count += packet->size_;
+
+    if (band->up.type == OFPMBT13_DROP) {
+        ovs_mutex_unlock(&dp->meter_locks[meter_id]);
+        return false; /* drop */
+    }
+ out:
+    ovs_mutex_unlock(&dp->meter_locks[meter_id]);
+    return true;
+}
+
+/* Meter set/get/del processing is still single-threaded. */
+static int
+dpif_netdev_meter_set(struct dpif *dpif, ofproto_meter_id *meter_id,
+                      struct ofputil_meter_config *config)
+{
+    struct dp_netdev *dp = get_dp_netdev(dpif);
+    uint32_t mid = meter_id->uint32;
+    struct dp_meter *meter;
+    int i;
+
+    if (mid == UINT32_MAX) {
+        mid = dp->meter_free;
+    }
+    if (mid >= MAX_METERS) {
+        return EFBIG; /* Meter_id out of range. */
+    }
+
+    if (config->flags & ~DP_SUPPORTED_METER_FLAGS_MASK ||
+        !(config->flags & (OFPMF13_PKTPS | OFPMF13_PKTPS))) {
+        return EBADF; /* Unsupported flags set */
+    }
+    /* Validate bands */
+    if (config->n_bands == 0 || config->n_bands > MAX_BANDS) {
+        return EINVAL; /* Too many bands */
+    }
+    for (i = 0; i < config->n_bands; ++i) {
+        switch (config->bands[i].type) {
+        case OFPMBT13_DROP:
+            break;
+        default:
+            return ENODEV; /* Unsupported band type */
+        }
+    }
+
+    /* Allocate meter */
+    meter = xzalloc(sizeof *meter
+                    + config->n_bands * sizeof(struct dp_meter_band));
+    if (meter) {
+        meter->flags = config->flags;
+        meter->n_bands = config->n_bands;
+        meter->max_delta_t = 0;
+        meter->used = time_msec();
+
+        /* set up bands */
+        for (i = 0; i < config->n_bands; ++i) {
+            uint32_t band_max_delta_t;
+
+            /* Set burst size to a workable value if none specified. */
+            if (config->bands[i].burst_size == 0) {
+                config->bands[i].burst_size = config->bands[i].rate;
+            }
+
+            meter->bands[i].up = config->bands[i];
+            /* Convert burst size to the bucket units: */
+            /* pkts => 1/1000 packets, kilobits => bits. */
+            meter->bands[i].up.burst_size *= 1000;
+            /* Initialize bucket to empty. */
+            meter->bands[i].bucket = 0;
+
+            /* Figure out max delta_t that is enough to fill any bucket. */
+            band_max_delta_t
+                = meter->bands[i].up.burst_size / meter->bands[i].up.rate;
+            if (band_max_delta_t > meter->max_delta_t) {
+                meter->max_delta_t = band_max_delta_t;
+            }
+        }
+
+        ovs_mutex_lock(&dp->meter_locks[mid]);
+        dp_delete_meter(dp, mid); /* Free existing meter, if any */
+        dp->meters[mid] = meter;
+        ovs_mutex_unlock(&dp->meter_locks[mid]);
+
+        meter_id->uint32 = mid; /* Store on success. */
+
+        /* Find next free meter */
+        if (dp->meter_free == mid) { /* Now taken. */
+            do {
+                if (++mid >= MAX_METERS) { /* Wrap around */
+                    mid = 0;
+                }
+                if (mid == dp->meter_free) { /* Full circle */
+                    mid = MAX_METERS;
+                    break;
+                }
+            } while (dp->meters[mid]);
+            dp->meter_free = mid; /* Next free meter or MAX_METERS */
+        }
+        return 0;
+    }
+    return ENOMEM;
 }
 
 static int
-dpif_netdev_meter_set(struct dpif *dpif OVS_UNUSED,
-                      ofproto_meter_id *meter_id OVS_UNUSED,
-                      struct ofputil_meter_config *config OVS_UNUSED)
+dpif_netdev_meter_get(const struct dpif *dpif,
+                      ofproto_meter_id meter_id_,
+                      struct ofputil_meter_stats *stats)
 {
-    return EFBIG; /* meter_id out of range */
+    const struct dp_netdev *dp = get_dp_netdev(dpif);
+    const struct dp_meter *meter;
+    uint32_t meter_id = meter_id_.uint32;
+
+    if (meter_id >= MAX_METERS) {
+        return EFBIG;
+    }
+    meter = dp->meters[meter_id];
+    if (!meter) {
+        return ENOENT;
+    }
+    if (stats) {
+        int i = 0;
+
+        ovs_mutex_lock(&dp->meter_locks[meter_id]);
+        stats->packet_in_count = meter->packet_count;
+        stats->byte_in_count = meter->byte_count;
+
+        for (i = 0; i < stats->n_bands && i < meter->n_bands; ++i) {
+            stats->bands[i].packet_count = meter->bands[i].packet_count;
+            stats->bands[i].byte_count = meter->bands[i].byte_count;
+        }
+        ovs_mutex_unlock(&dp->meter_locks[meter_id]);
+
+        stats->n_bands = i;
+    }
+    return 0;
 }
 
 static int
-dpif_netdev_meter_get(const struct dpif *dpif OVS_UNUSED,
-                      ofproto_meter_id meter_id OVS_UNUSED,
-                      struct ofputil_meter_stats *stats OVS_UNUSED)
+dpif_netdev_meter_del(struct dpif *dpif, ofproto_meter_id meter_id_,
+                      struct ofputil_meter_stats *stats)
 {
-    return EFBIG; /* meter_id out of range */
-}
+    struct dp_netdev *dp = get_dp_netdev(dpif);
+    int error;
 
-static int
-dpif_netdev_meter_del(struct dpif *dpif OVS_UNUSED,
-                      ofproto_meter_id meter_id OVS_UNUSED,
-                      struct ofputil_meter_stats *stats OVS_UNUSED)
-{
-    return EFBIG; /* meter_id out of range */
+    error = dpif_netdev_meter_get(dpif, meter_id_, stats);
+    if (!error) {
+        uint32_t meter_id = meter_id_.uint32;
+
+        ovs_mutex_lock(&dp->meter_locks[meter_id]);
+        dp_delete_meter(dp, meter_id);
+        ovs_mutex_unlock(&dp->meter_locks[meter_id]);
+
+        /* Keep free meter index as low as possible */
+        if (meter_id < dp->meter_free) {
+            dp->meter_free = meter_id;
+        }
+    }
+    return error;
 }
 
 
@@ -2160,7 +2416,7 @@ struct dp_netdev_execute_aux {
     const struct miniflow *key;
 };
 
-static void
+static bool
 dp_execute_cb(void *aux_, struct ofpbuf *packet,
               struct pkt_metadata *md,
               const struct nlattr *a, bool may_steal)
@@ -2181,6 +2437,7 @@ dp_execute_cb(void *aux_, struct ofpbuf *packet,
         }
 
         break;
+        return true;
 
     case OVS_ACTION_ATTR_USERSPACE: {
         const struct nlattr *userdata;
@@ -2199,6 +2456,7 @@ dp_execute_cb(void *aux_, struct ofpbuf *packet,
             ofpbuf_delete(packet);
         }
         break;
+        return true;
     }
 
     case OVS_ACTION_ATTR_HASH: {
@@ -2221,6 +2479,7 @@ dp_execute_cb(void *aux_, struct ofpbuf *packet,
 
         md->dp_hash = hash;
         break;
+        return true;
     }
 
     case OVS_ACTION_ATTR_RECIRC:
@@ -2236,6 +2495,7 @@ dp_execute_cb(void *aux_, struct ofpbuf *packet,
             (*depth)--;
 
             break;
+            return true;
         } else {
             if (may_steal) {
                 ofpbuf_delete(packet);
@@ -2243,8 +2503,11 @@ dp_execute_cb(void *aux_, struct ofpbuf *packet,
             VLOG_WARN("Packet dropped. Max recirculation depth exceeded.");
         }
         break;
+        return true;
 
 	case OVS_ACTION_ATTR_METER:
+        return dp_netdev_run_meter(aux->dp, packet, nl_attr_get_u32(a),
+                                   time_msec());
     case OVS_ACTION_ATTR_PUSH_VLAN:
     case OVS_ACTION_ATTR_POP_VLAN:
     case OVS_ACTION_ATTR_PUSH_MPLS:
@@ -2255,6 +2518,8 @@ dp_execute_cb(void *aux_, struct ofpbuf *packet,
     case __OVS_ACTION_ATTR_MAX:
         OVS_NOT_REACHED();
     }
+    
+    return false;
 }
 
 static void

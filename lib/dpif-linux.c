@@ -170,6 +170,7 @@ static int ovs_datapath_family;
 static int ovs_vport_family;
 static int ovs_flow_family;
 static int ovs_packet_family;
+static int ovs_meter_family;
 
 /* Generic Netlink multicast groups for OVS.
  *
@@ -1882,39 +1883,291 @@ dpif_linux_recv_purge(struct dpif *dpif_)
 }
 
 /* Meters */
+static int
+dpif_linux_meter_start(struct dpif_linux *dpif, struct ofpbuf *buf,
+                       void *stub, size_t size, uint32_t command)
+{
+    int error;
+    struct ovs_header *ovs_header;
+
+    ofpbuf_use_stub(buf, stub, size);
+
+    error = dpif_linux_init();
+    if (error) {
+        return error;
+    }
+
+    nl_msg_put_genlmsghdr(buf, 0, ovs_meter_family, NLM_F_REQUEST | NLM_F_ECHO,
+                          command, OVS_METER_VERSION);
+
+    ovs_header = ofpbuf_put_uninit(buf, sizeof *ovs_header);
+    ovs_header->dp_ifindex = dpif->dp_ifindex;
+
+    return 0;
+}
+
+static int
+dpif_linux_meter_transact(struct ofpbuf *buf, struct ofpbuf **p_reply,
+                          const struct nl_policy *reply_policy,
+                          struct nlattr **a, size_t size_a)
+{
+    int error;
+    struct nlmsghdr *nlmsg;
+    struct genlmsghdr *genl;
+    struct ovs_header *ovs_header;
+
+    error = nl_transact(NETLINK_GENERIC, buf, p_reply);
+    ofpbuf_uninit(buf);
+
+    if (error) {
+        VLOG_INFO("nl_transact for meter failed.");
+        return error;
+    }
+
+    nlmsg = ofpbuf_try_pull(*p_reply, sizeof *nlmsg);
+    genl = ofpbuf_try_pull(*p_reply, sizeof *genl);
+    ovs_header = ofpbuf_try_pull(*p_reply, sizeof *ovs_header);
+    if (!nlmsg || !genl || !ovs_header
+        || nlmsg->nlmsg_type != ovs_meter_family
+        || !nl_policy_parse(*p_reply, 0, reply_policy, a, size_a)) {
+        VLOG_INFO("Kernel module response to meter tranaction is invalid.");
+        return EINVAL;
+    }
+    return 0;
+}
+
 static void
-dpif_linux_meter_get_features(const struct dpif * dpif OVS_UNUSED,
+dpif_linux_meter_get_features(const struct dpif * dpif,
                               struct ofputil_meter_features *features)
 {
-    features->max_meters = 0;
-    features->band_types = 0;
-    features->capabilities = 0;
-    features->max_bands = 0;
-    features->max_color = 0;
+    struct ofpbuf buf, *msg;
+    uint64_t stub[1024/8];
+    int error;
+
+    static const struct nl_policy ovs_meter_features_policy[] = {
+        [OVS_METER_ATTR_MAX_METERS] = { .type = NL_A_U32 },
+        [OVS_METER_ATTR_MAX_BANDS] = { .type = NL_A_U32 },
+        [OVS_METER_ATTR_BANDS] = { .type = NL_A_NESTED, .optional = true },
+    };
+    struct nlattr *a[ARRAY_SIZE(ovs_meter_features_policy)];
+
+    memset(features, 0, sizeof *features);
+
+    error = dpif_linux_meter_start(dpif_linux_cast(dpif),
+                                   &buf, stub, sizeof stub,
+                                   OVS_METER_CMD_FEATURES);
+    if (!error) {
+        error
+            = dpif_linux_meter_transact(&buf, &msg, ovs_meter_features_policy,
+                                        a,
+                                        ARRAY_SIZE(ovs_meter_features_policy));
+    }
+    if (error) {
+        return;
+    }
+
+    features->max_meters = nl_attr_get_u32(a[OVS_METER_ATTR_MAX_METERS]);
+    features->max_bands = nl_attr_get_u32(a[OVS_METER_ATTR_MAX_BANDS]);
+
+    /* Bands is a nested attribute of zero or more nested band attributes.
+     */
+    if (a[OVS_METER_ATTR_BANDS]) {
+        const struct nlattr *nla;
+        size_t left;
+
+        NL_NESTED_FOR_EACH (nla, left, a[OVS_METER_ATTR_BANDS]) {
+            const struct nlattr *band_nla;
+            size_t band_left;
+
+            NL_NESTED_FOR_EACH (band_nla, band_left, nla) {
+                if (nl_attr_type(band_nla) == OVS_BAND_ATTR_TYPE) {
+                    if (nl_attr_get_size(band_nla) == sizeof(uint32_t)) {
+                        switch (nl_attr_get_u32(band_nla)) {
+                        case OVS_METER_BAND_TYPE_DROP:
+                            features->band_types |= 1 << OFPMBT13_DROP;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    features->capabilities = OFPMF13_KBPS | OFPMF13_PKTPS | OFPMF13_BURST
+        | OFPMF13_STATS;
 }
 
 static int
-dpif_linux_meter_set(struct dpif *dpif OVS_UNUSED,
-                     ofproto_meter_id *meter_id OVS_UNUSED,
-                     struct ofputil_meter_config *config OVS_UNUSED)
+dpif_linux_meter_set(struct dpif *dpif, ofproto_meter_id *meter_id,
+                     struct ofputil_meter_config *config)
 {
-    return EFBIG; /* meter_id out of range */
+    struct ofpbuf buf, *msg;
+    uint64_t stub[1024/8];
+    int error;
+    size_t i;
+
+    size_t bands_offset, band_offset;
+
+    static const struct nl_policy ovs_meter_set_response_policy[] = {
+        [OVS_METER_ATTR_ID] = { .type = NL_A_U32 },
+    };
+    struct nlattr *a[ARRAY_SIZE(ovs_meter_set_response_policy)];
+
+    /* Validate arguments. */
+    if (!(config->flags & (OFPMF13_KBPS | OFPMF13_PKTPS))) {
+        return EBADF; /* Rate unit type not set. */
+    }
+    if ((config->flags & OFPMF13_KBPS) && (config->flags & OFPMF13_PKTPS)) {
+        return EBADF; /* Both rate units may not be set. */
+    }
+    if (config->n_bands == 0) {
+        return EINVAL; /* No bands. */
+    }
+
+    error = dpif_linux_meter_start(dpif_linux_cast(dpif), &buf, stub,
+                                   sizeof stub, OVS_METER_CMD_SET);
+    if (error) {
+        return error;
+    }
+
+    if (meter_id->uint32 != UINT32_MAX) {
+        nl_msg_put_u32(&buf, OVS_METER_ATTR_ID, meter_id->uint32);
+    }
+    if (config->flags & OFPMF13_KBPS) {
+        nl_msg_put_flag(&buf, OVS_METER_ATTR_KBPS);
+    }
+
+    bands_offset = nl_msg_start_nested(&buf, OVS_METER_ATTR_BANDS);
+    /* Bands */
+    for (i = 0; i < config->n_bands; ++i) {
+        struct ofputil_meter_band * band = &config->bands[i];
+        uint32_t band_type;
+
+        band_offset = nl_msg_start_nested(&buf, OVS_BAND_ATTR_UNSPEC);
+
+        switch (band->type) {
+        case OFPMBT13_DROP:
+            band_type = OVS_METER_BAND_TYPE_DROP;
+            break;
+        default:
+            band_type = OVS_METER_BAND_TYPE_UNSPEC;
+        }
+        nl_msg_put_u32(&buf, OVS_BAND_ATTR_TYPE, band_type);
+        nl_msg_put_u32(&buf, OVS_BAND_ATTR_RATE, band->rate);
+        nl_msg_put_u32(&buf, OVS_BAND_ATTR_BURST,
+                       config->flags & OFPMF13_BURST ?
+                       band->burst_size : band->rate);
+        nl_msg_end_nested(&buf, band_offset);
+    }
+    nl_msg_end_nested(&buf, bands_offset);
+
+    error
+        = dpif_linux_meter_transact(&buf, &msg, ovs_meter_set_response_policy,
+                                    a,
+                                    ARRAY_SIZE(ovs_meter_set_response_policy));
+    if (error) {
+        VLOG_INFO("dpif_linux_meter_tranact OVS_METER_CMD_SET failed.");
+        return error;
+    }
+
+    meter_id->uint32 = nl_attr_get_u32(a[OVS_METER_ATTR_ID]);
+    return 0;
 }
 
 static int
-dpif_linux_meter_get(const struct dpif *dpif OVS_UNUSED,
-                     ofproto_meter_id meter_id OVS_UNUSED,
-                     struct ofputil_meter_stats *stats OVS_UNUSED)
+dpif_linux_meter_get_stats(const struct dpif *dpif,
+                           ofproto_meter_id meter_id,
+                           struct ofputil_meter_stats *stats,
+                           enum ovs_meter_cmd command)
+
 {
-    return EFBIG; /* meter_id out of range */
+    struct ofpbuf buf, *msg;
+    uint64_t stub[1024/8];
+    int error;
+    size_t n_band;
+
+    static const struct nl_policy ovs_meter_stats_policy[] = {
+        [OVS_METER_ATTR_ID] = { .type = NL_A_U32 },
+        [OVS_METER_ATTR_STATS] = { NL_POLICY_FOR(struct ovs_flow_stats) },
+        [OVS_METER_ATTR_BANDS] = { .type = NL_A_NESTED },
+    };
+    struct nlattr *a[ARRAY_SIZE(ovs_meter_stats_policy)];
+
+    error = dpif_linux_meter_start(dpif_linux_cast(dpif),
+                                   &buf, stub, sizeof stub, command);
+    if (error) {
+        return error;
+    }
+
+    nl_msg_put_u32(&buf, OVS_METER_ATTR_ID, meter_id.uint32);
+
+    error = dpif_linux_meter_transact(&buf, &msg, ovs_meter_stats_policy,
+                                      a,
+                                      ARRAY_SIZE(ovs_meter_stats_policy));
+    if (error) {
+        VLOG_INFO("dpif_linux_meter_transact %s failed.",
+                  command == OVS_METER_CMD_GET ? "get" : "del");
+        return error;
+    }
+
+    if (stats && nl_attr_get_u32(a[OVS_METER_ATTR_ID]) == meter_id.uint32) {
+        /* return stats */
+        const struct ovs_flow_stats *stat;
+        const struct nlattr *nla;
+        size_t left;
+
+        stat = nl_attr_get(a[OVS_METER_ATTR_STATS]);
+        stats->packet_in_count = stat->n_packets;
+        stats->byte_in_count = stat->n_bytes;
+
+        n_band = 0;
+
+        NL_NESTED_FOR_EACH (nla, left, a[OVS_METER_ATTR_BANDS]) {
+            const struct nlattr *band_nla;
+            size_t band_left;
+
+            stat = NULL;
+
+            NL_NESTED_FOR_EACH (band_nla, band_left, nla) {
+                if (nl_attr_type(band_nla) == OVS_BAND_ATTR_STATS
+                    && nl_attr_get_size(band_nla)
+                       == sizeof(struct ovs_flow_stats)) {
+                    stat = nl_attr_get(band_nla);
+                }
+            }
+            if (!stat) {
+                return EINVAL;
+            }
+
+            if (n_band < stats->n_bands) {
+                stats->bands[n_band].packet_count = stat->n_packets;
+                stats->bands[n_band].byte_count = stat->n_bytes;
+                ++n_band;
+            } else {
+                return EINVAL;
+            }
+        }
+        if (n_band < stats->n_bands) {
+            return EINVAL;
+        }
+    }
+    return 0;
 }
 
 static int
-dpif_linux_meter_del(struct dpif *dpif OVS_UNUSED,
-                     ofproto_meter_id meter_id OVS_UNUSED,
-                     struct ofputil_meter_stats *stats OVS_UNUSED)
+dpif_linux_meter_get(const struct dpif *dpif,
+                     ofproto_meter_id meter_id,
+                     struct ofputil_meter_stats *stats)
 {
-    return EFBIG; /* meter_id out of range */
+    return dpif_linux_meter_get_stats(dpif, meter_id, stats,
+                                      OVS_METER_CMD_GET);
+}
+
+static int
+dpif_linux_meter_del(struct dpif *dpif, ofproto_meter_id meter_id,
+                     struct ofputil_meter_stats *stats)
+{
+    return dpif_linux_meter_get_stats(dpif, meter_id, stats,
+                                      OVS_METER_CMD_DEL);
 }
 
 const struct dpif_class dpif_linux_class = {
@@ -1988,6 +2241,13 @@ dpif_linux_init(void)
         if (!error) {
             error = nl_lookup_genl_mcgroup(OVS_VPORT_FAMILY, OVS_VPORT_MCGROUP,
                                            &ovs_vport_mcgroup);
+        }
+
+        if (!error) {
+            error = nl_lookup_genl_family(OVS_METER_FAMILY, &ovs_meter_family);
+            if (error) {
+                ovs_meter_family = 0; /* No kernel support for meters. */
+            }
         }
 
         ovsthread_once_done(&once);

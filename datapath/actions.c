@@ -594,6 +594,10 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 		}
 
 		switch (nla_type(a)) {
+		case OVS_ACTION_ATTR_METER:
+			ovs_execute_meter_action(dp, skb, nla_get_u32(a));
+			break;
+
 		case OVS_ACTION_ATTR_OUTPUT:
 			prev_port = nla_get_u32(a);
 			break;

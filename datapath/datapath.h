@@ -37,6 +37,30 @@
 
 #define SAMPLE_ACTION_DEPTH 3
 
+#define DP_MAX_METERS		65536
+#define DP_MAX_BANDS		1
+#define DP_N_METER_LOCKS	17
+
+#define METER_LOCK(DP, METER_ID) \
+	&(DP)->meter_locks[(METER_ID) % DP_N_METER_LOCKS]
+
+struct dp_meter_band {
+	u32 type;
+	u32 rate;
+	u32 burst_size;
+	u32 bucket; /* 1/1000 packets, or in bits */
+	struct ovs_flow_stats stats;
+};
+
+struct dp_meter {
+	u16 kbps:1, keep_stats:1;
+	u16 n_bands;
+	u32 max_delta_t;
+	u64 used;
+	struct ovs_flow_stats stats;
+	struct dp_meter_band bands[];
+};
+
 /**
  * struct dp_stats_percpu - per-cpu packet processing statistics for a given
  * datapath.
@@ -90,6 +114,11 @@ struct datapath {
 	/* Network namespace ref. */
 	struct net *net;
 #endif
+
+	/* Meters. */
+	spinlock_t meter_locks[DP_N_METER_LOCKS];
+	struct dp_meter *meters[DP_MAX_METERS]; /* Meter bands. */
+	uint32_t meter_free;                 /* Next free meter. */
 
 	u32 user_features;
 };
@@ -208,4 +237,7 @@ do {								\
 	if (net_ratelimit())					\
 		pr_info("netlink: " fmt, ##__VA_ARGS__);	\
 } while (0)
+
+bool ovs_execute_meter_action(struct datapath *dp, struct sk_buff *skb,
+			      uint32_t meter_id);
 #endif /* datapath.h */

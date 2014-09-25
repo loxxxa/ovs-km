@@ -1441,6 +1441,7 @@ int ovs_nla_copy_actions(const struct nlattr *attr,
 	nla_for_each_nested(a, attr, rem) {
 		/* Expected argument lengths, (u32)-1 for variable length. */
 		static const u32 action_lens[OVS_ACTION_ATTR_MAX + 1] = {
+			[OVS_ACTION_ATTR_METER] = sizeof(u32),
 			[OVS_ACTION_ATTR_OUTPUT] = sizeof(u32),
 			[OVS_ACTION_ATTR_RECIRC] = sizeof(u32),
 			[OVS_ACTION_ATTR_USERSPACE] = (u32)-1,
@@ -1463,6 +1464,10 @@ int ovs_nla_copy_actions(const struct nlattr *attr,
 		switch (type) {
 		case OVS_ACTION_ATTR_UNSPEC:
 			return -EINVAL;
+
+		case OVS_ACTION_ATTR_METER:
+			/* Non-existent meters are simply ignored. */
+			break;
 
 		case OVS_ACTION_ATTR_USERSPACE:
 			err = validate_userspace(a);

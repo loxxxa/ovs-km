@@ -299,6 +299,7 @@ static struct hmap xports = HMAP_INITIALIZER(&xports);
 
 static bool may_receive(const struct xport *, struct xlate_ctx *);
 static void do_xlate_actions(const struct ofpact *, size_t ofpacts_len,
+							 const struct rule_actions * actions,
                              struct xlate_ctx *);
 static void xlate_actions__(struct xlate_in *, struct xlate_out *)
     OVS_REQ_RDLOCK(xlate_rwlock);
@@ -2004,7 +2005,7 @@ xlate_recursively(struct xlate_ctx *ctx, struct rule_dpif *rule)
     ctx->recurse++;
     ctx->rule = rule;
     actions = rule_dpif_get_actions(rule);
-    do_xlate_actions(actions->ofpacts, actions->ofpacts_len, ctx);
+    do_xlate_actions(actions->ofpacts, actions->ofpacts_len, actions, ctx);
     ctx->rule = old_rule;
     ctx->recurse--;
 }
@@ -2123,7 +2124,7 @@ xlate_group_bucket(struct xlate_ctx *ctx, const struct ofputil_bucket *bucket)
 
     ofpacts_execute_action_set(&action_list, &action_set);
     ctx->recurse++;
-    do_xlate_actions(ofpbuf_data(&action_list), ofpbuf_size(&action_list), ctx);
+    do_xlate_actions(ofpbuf_data(&action_list), ofpbuf_size(&action_list), NULL, ctx);
     ctx->recurse--;
 
     ofpbuf_uninit(&action_set);
@@ -2727,6 +2728,14 @@ xlate_sample_action(struct xlate_ctx *ctx,
                         probability, &cookie, sizeof cookie.flow_sample);
 }
 
+static void
+xlate_meter_action(struct xlate_ctx *ctx, uint32_t dp_mid)
+{
+    if (dp_mid != UINT32_MAX) {
+        nl_msg_put_u32(&ctx->xout->odp_actions, OVS_ACTION_ATTR_METER, dp_mid);
+    }
+}
+
 static bool
 may_receive(const struct xport *xport, struct xlate_ctx *ctx)
 {
@@ -2763,12 +2772,13 @@ xlate_action_set(struct xlate_ctx *ctx)
 
     ofpbuf_use_stub(&action_list, action_list_stub, sizeof action_list_stub);
     ofpacts_execute_action_set(&action_list, &ctx->action_set);
-    do_xlate_actions(ofpbuf_data(&action_list), ofpbuf_size(&action_list), ctx);
+    do_xlate_actions(ofpbuf_data(&action_list), ofpbuf_size(&action_list), NULL, ctx);
     ofpbuf_uninit(&action_list);
 }
 
 static void
 do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
+				 const struct rule_actions *actions,
                  struct xlate_ctx *ctx)
 {
     struct flow_wildcards *wc = &ctx->xout->wc;
@@ -3038,6 +3048,10 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
 
         case OFPACT_METER:
+            /* METER instruction can not exist in a bare action list. */
+            if (actions) {
+                xlate_meter_action(ctx, actions->provider_meter_id);
+            }
             /* Not implemented yet. */
             break;
 
@@ -3370,7 +3384,7 @@ xlate_actions__(struct xlate_in *xin, struct xlate_out *xout)
         sample_actions_len = ofpbuf_size(&ctx.xout->odp_actions);
 
         if (tnl_may_send && (!in_port || may_receive(in_port, &ctx))) {
-            do_xlate_actions(ofpacts, ofpacts_len, &ctx);
+            do_xlate_actions(ofpacts, ofpacts_len, actions, &ctx);
 
             /* We've let OFPP_NORMAL and the learning action look at the
              * packet, so drop it now if forwarding is disabled. */

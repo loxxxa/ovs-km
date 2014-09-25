@@ -1129,7 +1129,7 @@ struct dpif_execute_helper_aux {
 
 /* This is called for actions that need the context of the datapath to be
  * meaningful. */
-static void
+static bool
 dpif_execute_helper_cb(void *aux_, struct ofpbuf *packet,
                        struct pkt_metadata *md,
                        const struct nlattr *action, bool may_steal OVS_UNUSED)
@@ -1169,6 +1169,7 @@ dpif_execute_helper_cb(void *aux_, struct ofpbuf *packet,
             ofpbuf_uninit(&execute_actions);
         }
         break;
+		return aux->error == 0;
     }
 
 	case OVS_ACTION_ATTR_METER:
@@ -1183,6 +1184,7 @@ dpif_execute_helper_cb(void *aux_, struct ofpbuf *packet,
     case __OVS_ACTION_ATTR_MAX:
         OVS_NOT_REACHED();
     }
+    return false;
 }
 
 /* Executes 'execute' by performing most of the actions in userspace and
