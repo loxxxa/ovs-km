@@ -391,6 +391,7 @@
 #include <stdint.h>
 #include "netdev.h"
 #include "ofpbuf.h"
+#include "ofp-util.h"
 #include "openflow/openflow.h"
 #include "packets.h"
 #include "util.h"
@@ -648,6 +649,16 @@ int dpif_recv(struct dpif *, uint32_t handler_id, struct dpif_upcall *,
 void dpif_recv_purge(struct dpif *);
 void dpif_recv_wait(struct dpif *, uint32_t handler_id);
 
+/* Meters. */
+void dpif_meter_get_features(const struct dpif *,
+                             struct ofputil_meter_features *);
+int dpif_meter_set(struct dpif *, ofproto_meter_id *meter_id,
+                   struct ofputil_meter_config *);
+int dpif_meter_get(const struct dpif *, ofproto_meter_id meter_id,
+                   struct ofputil_meter_stats *);
+int dpif_meter_del(struct dpif *, ofproto_meter_id meter_id,
+                   struct ofputil_meter_stats *);
+
 /* Miscellaneous. */
 
 void dpif_get_netflow_ids(const struct dpif *,

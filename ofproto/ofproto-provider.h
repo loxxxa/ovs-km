@@ -1666,7 +1666,7 @@ struct ofproto_class {
      * leaving '*id' unchanged.  On failure, the existing meter configuration
      * is left intact. */
     enum ofperr (*meter_set)(struct ofproto *ofproto, ofproto_meter_id *id,
-                             const struct ofputil_meter_config *config);
+                             struct ofputil_meter_config *config);
 
     /* Gets the meter and meter band packet and byte counts for maximum of
      * 'stats->n_bands' bands for the meter with provider ID 'id' within

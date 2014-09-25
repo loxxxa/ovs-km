@@ -1728,6 +1728,43 @@ dpif_netdev_recv_purge(struct dpif *dpif)
     dp_netdev_purge_queues(dpif_netdev->dp);
     fat_rwlock_unlock(&dpif_netdev->dp->queue_rwlock);
 }
+
+/* Meters */
+static void
+dpif_netdev_meter_get_features(const struct dpif * dpif OVS_UNUSED,
+                               struct ofputil_meter_features *features)
+{
+    features->max_meters = 0;
+    features->band_types = 0;
+    features->capabilities = 0;
+    features->max_bands = 0;
+    features->max_color = 0;
+}
+
+static int
+dpif_netdev_meter_set(struct dpif *dpif OVS_UNUSED,
+                      ofproto_meter_id *meter_id OVS_UNUSED,
+                      struct ofputil_meter_config *config OVS_UNUSED)
+{
+    return EFBIG; /* meter_id out of range */
+}
+
+static int
+dpif_netdev_meter_get(const struct dpif *dpif OVS_UNUSED,
+                      ofproto_meter_id meter_id OVS_UNUSED,
+                      struct ofputil_meter_stats *stats OVS_UNUSED)
+{
+    return EFBIG; /* meter_id out of range */
+}
+
+static int
+dpif_netdev_meter_del(struct dpif *dpif OVS_UNUSED,
+                      ofproto_meter_id meter_id OVS_UNUSED,
+                      struct ofputil_meter_stats *stats OVS_UNUSED)
+{
+    return EFBIG; /* meter_id out of range */
+}
+
 
 /* Creates and returns a new 'struct dp_netdev_actions', with a reference count
  * of 1, whose actions are a copy of from the 'ofpacts_len' bytes of
@@ -2207,6 +2244,7 @@ dp_execute_cb(void *aux_, struct ofpbuf *packet,
         }
         break;
 
+	case OVS_ACTION_ATTR_METER:
     case OVS_ACTION_ATTR_PUSH_VLAN:
     case OVS_ACTION_ATTR_POP_VLAN:
     case OVS_ACTION_ATTR_PUSH_MPLS:
@@ -2269,6 +2307,10 @@ const struct dpif_class dpif_netdev_class = {
     dpif_netdev_recv,
     dpif_netdev_recv_wait,
     dpif_netdev_recv_purge,
+    dpif_netdev_meter_get_features,
+    dpif_netdev_meter_set,
+    dpif_netdev_meter_get,
+    dpif_netdev_meter_del,
 };
 
 static void

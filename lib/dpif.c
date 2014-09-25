@@ -55,6 +55,9 @@ COVERAGE_DEFINE(dpif_flow_del);
 COVERAGE_DEFINE(dpif_execute);
 COVERAGE_DEFINE(dpif_purge);
 COVERAGE_DEFINE(dpif_execute_with_help);
+COVERAGE_DEFINE(dpif_meter_set);
+COVERAGE_DEFINE(dpif_meter_get);
+COVERAGE_DEFINE(dpif_meter_del);
 
 static const struct dpif_class *base_dpif_classes[] = {
 #ifdef __linux__
@@ -1168,6 +1171,7 @@ dpif_execute_helper_cb(void *aux_, struct ofpbuf *packet,
         break;
     }
 
+	case OVS_ACTION_ATTR_METER:
     case OVS_ACTION_ATTR_HASH:
     case OVS_ACTION_ATTR_PUSH_VLAN:
     case OVS_ACTION_ATTR_POP_VLAN:
@@ -1617,4 +1621,89 @@ log_execute_message(struct dpif *dpif, const struct dpif_execute *execute,
         ds_destroy(&ds);
         free(packet);
     }
+}
+
+
+/* Meters */
+void
+dpif_meter_get_features(const struct dpif *dpif,
+                        struct ofputil_meter_features *features)
+{
+    memset(features, 0, sizeof *features);
+    if (dpif->dpif_class->meter_get_features) {
+        dpif->dpif_class->meter_get_features(dpif, features);
+    }
+}
+
+/* Adds or modifies 'meter' in 'dpif'.   If '*meter_id' is UINT32_MAX,
+ * adds a new meter, otherwise modifies an existing meter.
+ *
+ * If meter is successfully added, sets '*meter_id' to the new meter's
+ * meter number. */
+int
+dpif_meter_set(struct dpif *dpif, ofproto_meter_id *meter_id,
+               struct ofputil_meter_config * config)
+{
+    int error;
+
+    COVERAGE_INC(dpif_meter_set);
+
+    error = dpif->dpif_class->meter_set(dpif, meter_id, config);
+    if (!error) {
+        VLOG_DBG_RL(&dpmsg_rl, "%s: DPIF meter %"PRIu32" set",
+                    dpif_name(dpif), meter_id->uint32);
+    } else {
+        VLOG_WARN_RL(&error_rl, "%s: failed to set DPIF meter %"PRIu32": %s",
+                     dpif_name(dpif), meter_id->uint32, ovs_strerror(error));
+        meter_id->uint32 = UINT32_MAX;
+    }
+    return error;
+}
+
+int
+dpif_meter_get(const struct dpif *dpif, ofproto_meter_id meter_id,
+               struct ofputil_meter_stats *stats)
+{
+    int error;
+
+    COVERAGE_INC(dpif_meter_get);
+
+    error = dpif->dpif_class->meter_get(dpif, meter_id, stats);
+    if (!error) {
+        VLOG_DBG_RL(&dpmsg_rl, "%s: DPIF meter %"PRIu32" get stats",
+                    dpif_name(dpif), meter_id.uint32);
+    } else {
+        VLOG_WARN_RL(&error_rl,
+                     "%s: failed to get DPIF meter %"PRIu32" stats: %s",
+                     dpif_name(dpif), meter_id.uint32, ovs_strerror(error));
+        stats->packet_in_count = ~0;
+        stats->byte_in_count = ~0;
+        stats->n_bands = 0;
+    }
+    return error;
+}
+
+int
+dpif_meter_del(struct dpif *dpif, ofproto_meter_id meter_id,
+               struct ofputil_meter_stats *stats)
+{
+    int error;
+
+    COVERAGE_INC(dpif_meter_del);
+
+    error = dpif->dpif_class->meter_del(dpif, meter_id, stats);
+    if (!error) {
+        VLOG_DBG_RL(&dpmsg_rl, "%s: DPIF meter %"PRIu32" deleted",
+                    dpif_name(dpif), meter_id.uint32);
+    } else {
+        VLOG_WARN_RL(&error_rl,
+                     "%s: failed to delete DPIF meter %"PRIu32": %s",
+                     dpif_name(dpif), meter_id.uint32, ovs_strerror(error));
+        if (stats) {
+            stats->packet_in_count = ~0;
+            stats->byte_in_count = ~0;
+            stats->n_bands = 0;
+        }
+    }
+    return error;
 }
